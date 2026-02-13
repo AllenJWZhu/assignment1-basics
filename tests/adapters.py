@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+import regex as re
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -589,4 +591,132 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # GPT-2 pre-tokenization pattern.
+    pretoken_pattern = re.compile(
+        r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    )
+
+    def merge_pair_in_word(word: tuple[int, ...], pair: tuple[int, int], new_token_id: int) -> tuple[int, ...]:
+        # Replace all non-overlapping occurrences of `pair` in one tokenized word.
+        if len(word) < 2:
+            return word
+        merged: list[int] = []
+        i = 0
+        first, second = pair
+        while i < len(word):
+            if i + 1 < len(word) and word[i] == first and word[i + 1] == second:
+                merged.append(new_token_id)
+                i += 2
+            else:
+                merged.append(word[i])
+                i += 1
+        return tuple(merged)
+
+    # Initial byte-level vocabulary: one token for each byte value.
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    # Special tokens are added to vocab but excluded from merge training.
+    for token in special_tokens:
+        vocab[len(vocab)] = token.encode("utf-8")
+
+    # Nothing to train if target vocabulary is already reached.
+    if vocab_size <= len(vocab):
+        return vocab, []
+
+    with open(input_path, encoding="utf-8") as f:
+        corpus = f.read()
+
+    if special_tokens:
+        # Remove special-token spans from training text by splitting on them.
+        # Longest-first avoids issues when special tokens overlap.
+        special_pattern = re.compile("|".join(re.escape(token) for token in sorted(special_tokens, key=len, reverse=True)))
+        training_text_segments = special_pattern.split(corpus)
+    else:
+        training_text_segments = [corpus]
+
+    # Count each unique pre-token (as UTF-8 bytes) with its corpus frequency.
+    pretoken_counts: Counter[bytes] = Counter()
+    for segment in training_text_segments:
+        for match in pretoken_pattern.finditer(segment):
+            pretoken_counts[match.group(0).encode("utf-8")] += 1
+
+    # Represent each unique pre-token as a tuple of token IDs (initially bytes 0..255).
+    word_by_id: dict[int, tuple[int, ...]] = {}
+    word_freq_by_id: dict[int, int] = {}
+    for word_id, (word_bytes, freq) in enumerate(pretoken_counts.items()):
+        word_by_id[word_id] = tuple(word_bytes)
+        word_freq_by_id[word_id] = freq
+
+    # pair_counts: global weighted frequency of each adjacent token-id pair.
+    # pair_to_words: reverse index so each merge updates only affected words.
+    pair_counts: dict[tuple[int, int], int] = defaultdict(int)
+    pair_to_words: dict[tuple[int, int], set[int]] = defaultdict(set)
+
+    for word_id, word in word_by_id.items():
+        if len(word) < 2:
+            continue
+        word_freq = word_freq_by_id[word_id]
+        local_pair_counts = Counter(zip(word, word[1:]))
+        for pair, local_count in local_pair_counts.items():
+            pair_counts[pair] += local_count * word_freq
+            pair_to_words[pair].add(word_id)
+
+    merges: list[tuple[bytes, bytes]] = []
+
+    while len(vocab) < vocab_size and pair_counts:
+        best_pair: tuple[int, int] | None = None
+        best_pair_count = 0
+        best_pair_bytes: tuple[bytes, bytes] | None = None
+
+        for pair, count in pair_counts.items():
+            if count <= 0:
+                continue
+            pair_bytes = (vocab[pair[0]], vocab[pair[1]])
+            # Tie-break rule: for equal counts, prefer lexicographically larger byte-pair.
+            if (
+                count > best_pair_count
+                or (count == best_pair_count and best_pair is not None and pair_bytes > best_pair_bytes)
+                or (count == best_pair_count and best_pair is None)
+            ):
+                best_pair = pair
+                best_pair_count = count
+                best_pair_bytes = pair_bytes
+
+        if best_pair is None:
+            break
+
+        assert best_pair_bytes is not None
+        new_token_id = len(vocab)
+        # New token is concatenation of the chosen pair.
+        vocab[new_token_id] = best_pair_bytes[0] + best_pair_bytes[1]
+        merges.append(best_pair_bytes)
+
+        # Only words that contain the chosen pair can change this round.
+        affected_word_ids = pair_to_words.pop(best_pair, set())
+        for word_id in affected_word_ids:
+            old_word = word_by_id[word_id]
+            word_freq = word_freq_by_id[word_id]
+
+            # Remove old pair contributions for this word.
+            old_local_pair_counts = Counter(zip(old_word, old_word[1:]))
+            for pair, local_count in old_local_pair_counts.items():
+                updated_count = pair_counts.get(pair, 0) - local_count * word_freq
+                if updated_count > 0:
+                    pair_counts[pair] = updated_count
+                else:
+                    pair_counts.pop(pair, None)
+
+                if pair in pair_to_words:
+                    pair_to_words[pair].discard(word_id)
+                    if not pair_to_words[pair]:
+                        pair_to_words.pop(pair, None)
+
+            new_word = merge_pair_in_word(old_word, best_pair, new_token_id)
+            word_by_id[word_id] = new_word
+
+            # Add new pair contributions for this word.
+            new_local_pair_counts = Counter(zip(new_word, new_word[1:]))
+            for pair, local_count in new_local_pair_counts.items():
+                pair_counts[pair] = pair_counts.get(pair, 0) + local_count * word_freq
+                pair_to_words[pair].add(word_id)
+
+    return vocab, merges
