@@ -12,6 +12,7 @@ import regex as re
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from tqdm import tqdm
 
 GPT2_PRETOKEN_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -679,6 +680,7 @@ def run_train_bpe(
     pretoken_pattern = re.compile(GPT2_PRETOKEN_PATTERN)
     special_split_pattern = _build_special_split_pattern(special_tokens)
     num_processes = int(kwargs.get("num_processes", 1))
+    verbose = bool(kwargs.get("verbose", False))
 
     def merge_pair_in_word(word: tuple[int, ...], pair: tuple[int, int], new_token_id: int) -> tuple[int, ...]:
         # Replace all non-overlapping occurrences of `pair` in one tokenized word.
@@ -714,18 +716,20 @@ def run_train_bpe(
         chunk_ranges = list(zip(boundaries[:-1], boundaries[1:]))
 
         if len(chunk_ranges) > 1:
+            pretoken_counts: Counter[bytes] = Counter()
             with mp.Pool(
                 processes=min(num_processes, len(chunk_ranges)),
                 initializer=_init_pretoken_worker,
                 initargs=(special_tokens,),
             ) as pool:
-                chunk_counters = pool.map(
+                chunk_iter = pool.imap_unordered(
                     _count_pretokens_in_chunk,
                     [(os.fspath(input_path), start, end) for start, end in chunk_ranges],
                 )
-            pretoken_counts: Counter[bytes] = Counter()
-            for c in chunk_counters:
-                pretoken_counts.update(c)
+                if verbose:
+                    chunk_iter = tqdm(chunk_iter, total=len(chunk_ranges), desc="Pretokenize chunks", unit="chunk")
+                for c in chunk_iter:
+                    pretoken_counts.update(c)
         else:
             with open(input_path, encoding="utf-8") as f:
                 corpus = f.read()
@@ -761,6 +765,8 @@ def run_train_bpe(
     heapq.heapify(pair_heap)
 
     merges: list[tuple[bytes, bytes]] = []
+    target_merges = max(0, vocab_size - len(vocab))
+    merge_pbar = tqdm(total=target_merges, desc="BPE merges", unit="merge", disable=not verbose)
 
     while len(vocab) < vocab_size and pair_counts and pair_heap:
         best_count: int | None = None
@@ -796,6 +802,7 @@ def run_train_bpe(
         # New token is concatenation of the chosen pair.
         vocab[new_token_id] = best_pair_bytes[0] + best_pair_bytes[1]
         merges.append(best_pair_bytes)
+        merge_pbar.update(1)
 
         # Only words that contain the chosen pair can change this round.
         affected_word_ids = pair_to_words.pop(best_pair, set())
@@ -829,6 +836,7 @@ def run_train_bpe(
                 heapq.heappush(pair_heap, (-new_count, pair))
                 pair_to_words[pair].add(word_id)
 
+    merge_pbar.close()
     return vocab, merges
 
 
