@@ -104,6 +104,7 @@ def run_train_bpe(
     pretoken_pattern = re.compile(GPT2_PRETOKEN_PATTERN)
     special_split_pattern = _build_special_split_pattern(special_tokens)
     num_processes = int(kwargs.get("num_processes", 1))
+    num_chunks = int(kwargs.get("num_chunks", max(num_processes * 8, num_processes)))
     verbose = bool(kwargs.get("verbose", False))
 
     def merge_pair_in_word(word: tuple[int, ...], pair: tuple[int, int], new_token_id: int) -> tuple[int, ...]:
@@ -129,9 +130,10 @@ def run_train_bpe(
         return vocab, []
 
     if num_processes > 1 and special_tokens:
+        desired_num_chunks = max(1, max(num_processes, num_chunks))
         split_token = "<|endoftext|>" if "<|endoftext|>" in special_tokens else max(special_tokens, key=len)
         with open(input_path, "rb") as f:
-            boundaries = _find_chunk_boundaries(f, num_processes, split_token.encode("utf-8"))
+            boundaries = _find_chunk_boundaries(f, desired_num_chunks, split_token.encode("utf-8"))
         chunk_ranges = list(zip(boundaries[:-1], boundaries[1:]))
 
         if len(chunk_ranges) > 1:
@@ -144,6 +146,7 @@ def run_train_bpe(
                 chunk_iter = pool.imap_unordered(
                     _count_pretokens_in_chunk,
                     [(os.fspath(input_path), start, end) for start, end in chunk_ranges],
+                    chunksize=1,
                 )
                 if verbose:
                     chunk_iter = tqdm(chunk_iter, total=len(chunk_ranges), desc="Pretokenize chunks", unit="chunk")

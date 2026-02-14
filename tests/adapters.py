@@ -610,7 +610,9 @@ def run_train_bpe_tinystories(
     """
     if special_tokens is None:
         special_tokens = ["<|endoftext|>"]
-    kwargs.setdefault("num_processes", max(1, os.cpu_count() or 1))
+    default_procs = min(8, max(1, os.cpu_count() or 1))
+    kwargs.setdefault("num_processes", default_procs)
+    kwargs.setdefault("num_chunks", max(int(kwargs["num_processes"]) * 8, int(kwargs["num_processes"])))
     return run_train_bpe(
         input_path=input_path,
         vocab_size=vocab_size,
@@ -630,7 +632,9 @@ def run_train_bpe_openwebtext(
     """
     if special_tokens is None:
         special_tokens = ["<|endoftext|>"]
-    kwargs.setdefault("num_processes", max(1, os.cpu_count() or 1))
+    default_procs = min(8, max(1, os.cpu_count() or 1))
+    kwargs.setdefault("num_processes", default_procs)
+    kwargs.setdefault("num_chunks", max(int(kwargs["num_processes"]) * 8, int(kwargs["num_processes"])))
     return run_train_bpe(
         input_path=input_path,
         vocab_size=vocab_size,

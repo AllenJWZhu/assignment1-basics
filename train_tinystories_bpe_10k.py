@@ -15,6 +15,8 @@ from tests.common import gpt2_bytes_to_unicode
 def main() -> None:
     out_dir = pathlib.Path("artifacts/tinystories_bpe_10k")
     out_dir.mkdir(parents=True, exist_ok=True)
+    num_processes = min(8, max(1, os.cpu_count() or 1))
+    num_chunks = max(num_processes * 8, num_processes)
 
     peak_rss = {"value": 0}
     stop = {"flag": False}
@@ -37,7 +39,8 @@ def main() -> None:
     vocab, merges = run_train_bpe_tinystories(
         vocab_size=10_000,
         special_tokens=["<|endoftext|>"],
-        num_processes=max(1, os.cpu_count() or 1),
+        num_processes=num_processes,
+        num_chunks=num_chunks,
         verbose=True,
     )
     t1 = time.time()
