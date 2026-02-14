@@ -161,3 +161,7 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+# Project-generated training data and outputs
+data/
+artifacts/
