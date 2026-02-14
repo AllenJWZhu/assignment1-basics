@@ -1,101 +1,13 @@
 from __future__ import annotations
 
-import heapq
-import multiprocessing as mp
 import os
-from collections import Counter, defaultdict
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
-import regex as re
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from tqdm import tqdm
-
-GPT2_PRETOKEN_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
-_WORKER_PRETOKEN_PATTERN: re.Pattern[str] | None = None
-_WORKER_SPECIAL_SPLIT_PATTERN: re.Pattern[str] | None = None
-
-
-def _find_chunk_boundaries(
-    file: BinaryIO,
-    desired_num_chunks: int,
-    split_special_token: bytes,
-) -> list[int]:
-    """
-    Chunk a byte file into independent ranges whose boundaries align with the
-    start of `split_special_token`.
-    """
-    assert isinstance(split_special_token, bytes), "split_special_token must be bytes."
-
-    file.seek(0, os.SEEK_END)
-    file_size = file.tell()
-    file.seek(0)
-
-    chunk_size = file_size // desired_num_chunks
-    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
-    chunk_boundaries[-1] = file_size
-
-    mini_chunk_size = 4096
-    for bi in range(1, len(chunk_boundaries) - 1):
-        initial_position = chunk_boundaries[bi]
-        file.seek(initial_position)
-        while True:
-            mini_chunk = file.read(mini_chunk_size)
-            if mini_chunk == b"":
-                chunk_boundaries[bi] = file_size
-                break
-            found_at = mini_chunk.find(split_special_token)
-            if found_at != -1:
-                chunk_boundaries[bi] = initial_position + found_at
-                break
-            initial_position += mini_chunk_size
-
-    return sorted(set(chunk_boundaries))
-
-
-def _build_special_split_pattern(special_tokens: list[str]) -> re.Pattern[str] | None:
-    if not special_tokens:
-        return None
-    # Longest-first avoids issues with overlapping special tokens.
-    escaped = [re.escape(token) for token in sorted(special_tokens, key=len, reverse=True)]
-    return re.compile("|".join(escaped))
-
-
-def _count_pretokens_in_text(
-    text: str,
-    pretoken_pattern: re.Pattern[str],
-    special_split_pattern: re.Pattern[str] | None,
-) -> Counter[bytes]:
-    segments = special_split_pattern.split(text) if special_split_pattern else [text]
-    counts: Counter[bytes] = Counter()
-    for segment in segments:
-        for match in pretoken_pattern.finditer(segment):
-            counts[match.group(0).encode("utf-8")] += 1
-    return counts
-
-
-def _init_pretoken_worker(special_tokens: list[str]) -> None:
-    global _WORKER_PRETOKEN_PATTERN, _WORKER_SPECIAL_SPLIT_PATTERN
-    _WORKER_PRETOKEN_PATTERN = re.compile(GPT2_PRETOKEN_PATTERN)
-    _WORKER_SPECIAL_SPLIT_PATTERN = _build_special_split_pattern(special_tokens)
-
-
-def _count_pretokens_in_chunk(args: tuple[str, int, int]) -> Counter[bytes]:
-    input_path, start, end = args
-    assert _WORKER_PRETOKEN_PATTERN is not None
-    with open(input_path, "rb") as f:
-        f.seek(start)
-        chunk = f.read(end - start)
-    chunk_text = chunk.decode("utf-8", errors="ignore")
-    return _count_pretokens_in_text(
-        chunk_text,
-        _WORKER_PRETOKEN_PATTERN,
-        _WORKER_SPECIAL_SPLIT_PATTERN,
-    )
 
 
 def run_linear(
@@ -677,167 +589,14 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    pretoken_pattern = re.compile(GPT2_PRETOKEN_PATTERN)
-    special_split_pattern = _build_special_split_pattern(special_tokens)
-    num_processes = int(kwargs.get("num_processes", 1))
-    verbose = bool(kwargs.get("verbose", False))
+    from cs336_basics.bpe_training import run_train_bpe as _run_train_bpe_impl
 
-    def merge_pair_in_word(word: tuple[int, ...], pair: tuple[int, int], new_token_id: int) -> tuple[int, ...]:
-        # Replace all non-overlapping occurrences of `pair` in one tokenized word.
-        if len(word) < 2:
-            return word
-        merged: list[int] = []
-        i = 0
-        first, second = pair
-        while i < len(word):
-            if i + 1 < len(word) and word[i] == first and word[i + 1] == second:
-                merged.append(new_token_id)
-                i += 2
-            else:
-                merged.append(word[i])
-                i += 1
-        return tuple(merged)
-
-    # Initial byte-level vocabulary: one token for each byte value.
-    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-    # Special tokens are added to vocab but excluded from merge training.
-    for token in special_tokens:
-        vocab[len(vocab)] = token.encode("utf-8")
-
-    # Nothing to train if target vocabulary is already reached.
-    if vocab_size <= len(vocab):
-        return vocab, []
-
-    # For large corpora, parallelize pre-tokenization over chunks that start at special-token boundaries.
-    if num_processes > 1 and special_tokens:
-        split_token = "<|endoftext|>" if "<|endoftext|>" in special_tokens else max(special_tokens, key=len)
-        with open(input_path, "rb") as f:
-            boundaries = _find_chunk_boundaries(f, num_processes, split_token.encode("utf-8"))
-        chunk_ranges = list(zip(boundaries[:-1], boundaries[1:]))
-
-        if len(chunk_ranges) > 1:
-            pretoken_counts: Counter[bytes] = Counter()
-            with mp.Pool(
-                processes=min(num_processes, len(chunk_ranges)),
-                initializer=_init_pretoken_worker,
-                initargs=(special_tokens,),
-            ) as pool:
-                chunk_iter = pool.imap_unordered(
-                    _count_pretokens_in_chunk,
-                    [(os.fspath(input_path), start, end) for start, end in chunk_ranges],
-                )
-                if verbose:
-                    chunk_iter = tqdm(chunk_iter, total=len(chunk_ranges), desc="Pretokenize chunks", unit="chunk")
-                for c in chunk_iter:
-                    pretoken_counts.update(c)
-        else:
-            with open(input_path, encoding="utf-8") as f:
-                corpus = f.read()
-            pretoken_counts = _count_pretokens_in_text(corpus, pretoken_pattern, special_split_pattern)
-    else:
-        with open(input_path, encoding="utf-8") as f:
-            corpus = f.read()
-        pretoken_counts = _count_pretokens_in_text(corpus, pretoken_pattern, special_split_pattern)
-
-    # Represent each unique pre-token as a tuple of token IDs (initially bytes 0..255).
-    word_by_id: dict[int, tuple[int, ...]] = {}
-    word_freq_by_id: dict[int, int] = {}
-    for word_id, (word_bytes, freq) in enumerate(pretoken_counts.items()):
-        word_by_id[word_id] = tuple(word_bytes)
-        word_freq_by_id[word_id] = freq
-
-    # pair_counts: global weighted frequency of each adjacent token-id pair.
-    # pair_to_words: reverse index so each merge updates only affected words.
-    pair_counts: dict[tuple[int, int], int] = defaultdict(int)
-    pair_to_words: dict[tuple[int, int], set[int]] = defaultdict(set)
-
-    for word_id, word in word_by_id.items():
-        if len(word) < 2:
-            continue
-        word_freq = word_freq_by_id[word_id]
-        local_pair_counts = Counter(zip(word, word[1:]))
-        for pair, local_count in local_pair_counts.items():
-            pair_counts[pair] += local_count * word_freq
-            pair_to_words[pair].add(word_id)
-
-    # Max-heap over pair counts; we use lazy deletion and explicit tie-break on byte pairs.
-    pair_heap: list[tuple[int, tuple[int, int]]] = [(-count, pair) for pair, count in pair_counts.items() if count > 0]
-    heapq.heapify(pair_heap)
-
-    merges: list[tuple[bytes, bytes]] = []
-    target_merges = max(0, vocab_size - len(vocab))
-    merge_pbar = tqdm(total=target_merges, desc="BPE merges", unit="merge", disable=not verbose)
-
-    while len(vocab) < vocab_size and pair_counts and pair_heap:
-        best_count: int | None = None
-        candidate_pairs: list[tuple[int, int]] = []
-
-        while pair_heap:
-            neg_count, pair = heapq.heappop(pair_heap)
-            count = -neg_count
-            # Skip stale heap entries.
-            if pair_counts.get(pair, 0) != count:
-                continue
-            best_count = count
-            candidate_pairs.append(pair)
-            # Collect all currently-valid pairs with same max count, then tie-break by bytes.
-            while pair_heap and -pair_heap[0][0] == count:
-                neg_count2, pair2 = heapq.heappop(pair_heap)
-                count2 = -neg_count2
-                if pair_counts.get(pair2, 0) == count2:
-                    candidate_pairs.append(pair2)
-            break
-
-        if best_count is None or not candidate_pairs:
-            break
-
-        best_pair = max(candidate_pairs, key=lambda p: (vocab[p[0]], vocab[p[1]]))
-        for pair in candidate_pairs:
-            if pair != best_pair:
-                heapq.heappush(pair_heap, (-best_count, pair))
-
-        best_pair_bytes = (vocab[best_pair[0]], vocab[best_pair[1]])
-        assert best_pair_bytes is not None
-        new_token_id = len(vocab)
-        # New token is concatenation of the chosen pair.
-        vocab[new_token_id] = best_pair_bytes[0] + best_pair_bytes[1]
-        merges.append(best_pair_bytes)
-        merge_pbar.update(1)
-
-        # Only words that contain the chosen pair can change this round.
-        affected_word_ids = pair_to_words.pop(best_pair, set())
-        for word_id in affected_word_ids:
-            old_word = word_by_id[word_id]
-            word_freq = word_freq_by_id[word_id]
-
-            # Remove old pair contributions for this word.
-            old_local_pair_counts = Counter(zip(old_word, old_word[1:]))
-            for pair, local_count in old_local_pair_counts.items():
-                updated_count = pair_counts.get(pair, 0) - local_count * word_freq
-                if updated_count > 0:
-                    pair_counts[pair] = updated_count
-                    heapq.heappush(pair_heap, (-updated_count, pair))
-                else:
-                    pair_counts.pop(pair, None)
-
-                if pair in pair_to_words:
-                    pair_to_words[pair].discard(word_id)
-                    if not pair_to_words[pair]:
-                        pair_to_words.pop(pair, None)
-
-            new_word = merge_pair_in_word(old_word, best_pair, new_token_id)
-            word_by_id[word_id] = new_word
-
-            # Add new pair contributions for this word.
-            new_local_pair_counts = Counter(zip(new_word, new_word[1:]))
-            for pair, local_count in new_local_pair_counts.items():
-                new_count = pair_counts.get(pair, 0) + local_count * word_freq
-                pair_counts[pair] = new_count
-                heapq.heappush(pair_heap, (-new_count, pair))
-                pair_to_words[pair].add(word_id)
-
-    merge_pbar.close()
-    return vocab, merges
+    return _run_train_bpe_impl(
+        input_path=input_path,
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+        **kwargs,
+    )
 
 
 def run_train_bpe_tinystories(
