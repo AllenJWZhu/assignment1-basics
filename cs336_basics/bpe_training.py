@@ -184,6 +184,7 @@ def run_train_bpe(
     merges: list[tuple[bytes, bytes]] = []
     target_merges = max(0, vocab_size - len(vocab))
     merge_pbar = tqdm(total=target_merges, desc="BPE merges", unit="merge", disable=not verbose)
+    merges_since_heap_rebuild = 0
 
     while len(vocab) < vocab_size and pair_counts and pair_heap:
         best_count: int | None = None
@@ -218,22 +219,20 @@ def run_train_bpe(
         merge_pbar.update(1)
 
         affected_word_ids = pair_to_words.pop(best_pair, set())
+        # Aggregate pair-count deltas across all affected words, then apply once.
+        pair_count_deltas: dict[tuple[int, int], int] = defaultdict(int)
         for word_id in affected_word_ids:
             old_word = word_by_id[word_id]
             word_freq = word_freq_by_id[word_id]
 
             old_local_pair_counts = Counter(zip(old_word, old_word[1:]))
             for pair, local_count in old_local_pair_counts.items():
-                updated_count = pair_counts.get(pair, 0) - local_count * word_freq
-                if updated_count > 0:
-                    pair_counts[pair] = updated_count
-                    heapq.heappush(pair_heap, (-updated_count, pair))
-                else:
-                    pair_counts.pop(pair, None)
+                pair_count_deltas[pair] -= local_count * word_freq
 
-                if pair in pair_to_words:
-                    pair_to_words[pair].discard(word_id)
-                    if not pair_to_words[pair]:
+                word_set = pair_to_words.get(pair)
+                if word_set is not None:
+                    word_set.discard(word_id)
+                    if not word_set:
                         pair_to_words.pop(pair, None)
 
             new_word = merge_pair_in_word(old_word, best_pair, new_token_id)
@@ -241,10 +240,27 @@ def run_train_bpe(
 
             new_local_pair_counts = Counter(zip(new_word, new_word[1:]))
             for pair, local_count in new_local_pair_counts.items():
-                new_count = pair_counts.get(pair, 0) + local_count * word_freq
+                pair_count_deltas[pair] += local_count * word_freq
+                pair_to_words[pair].add(word_id)
+
+        for pair, delta in pair_count_deltas.items():
+            if delta == 0:
+                continue
+            new_count = pair_counts.get(pair, 0) + delta
+            if new_count > 0:
                 pair_counts[pair] = new_count
                 heapq.heappush(pair_heap, (-new_count, pair))
-                pair_to_words[pair].add(word_id)
+            else:
+                pair_counts.pop(pair, None)
+                if pair in pair_to_words and not pair_to_words[pair]:
+                    pair_to_words.pop(pair, None)
+
+        merges_since_heap_rebuild += 1
+        # Periodically rebuild heap to drop stale entries from lazy updates.
+        if merges_since_heap_rebuild >= 50 and len(pair_heap) > (len(pair_counts) * 3 + 2048):
+            pair_heap = [(-count, pair) for pair, count in pair_counts.items() if count > 0]
+            heapq.heapify(pair_heap)
+            merges_since_heap_rebuild = 0
 
     merge_pbar.close()
     return vocab, merges
